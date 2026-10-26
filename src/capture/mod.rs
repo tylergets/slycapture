@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod encoder;
 pub mod options;
 pub mod recorder;
 pub mod region;

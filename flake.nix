@@ -51,7 +51,7 @@
           // {
             inherit cargoArtifacts;
             pname = "slycapture";
-            version = "0.1.0";
+            version = "0.2.0";
             meta = {
               mainProgram = "slycapture";
             };

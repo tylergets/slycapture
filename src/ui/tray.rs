@@ -10,19 +10,26 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use gtk::glib::{self, ControlFlow, SourceId};
 
+use crate::capture::encoder::{self, VideoEncoder};
 use crate::capture::options::{sanitize_base_name, Format};
 use crate::capture::transcode::{IntroSettings, JobState, TranscodeJob, TranscodeSettings};
-use crate::zoom::cursor_log::{self, CursorLogger};
 use crate::capture::{Recording, RecordingOptions, Region, Target};
 use crate::config::AppConfig;
 use crate::core::control::{self, Action, ActionRequest};
+use crate::core::saved_options;
 use crate::core::status::{format_elapsed, JobStatus, State, Status};
-use crate::platform::applet::{self, notify, Applet, IconState, MenuEntry, TraySpec};
+use crate::platform::applet::{
+    self, notify, notify_with_actions, Applet, IconState, MenuEntry, TraySpec,
+};
+use crate::platform::desktop;
 use crate::platform::dunst::{self, DndGuard};
 use crate::platform::i3::{self, WindowPlacement};
 use crate::platform::x11;
+use crate::ui::marker::Marker;
 use crate::ui::region_select;
 use crate::ui::setup_dialog::{self, SetupContext};
+use crate::zoom::cursor_log::{self, CursorLogger};
+use crate::zoom::zoomed_path;
 
 const APP_ID: &str = "slycapture";
 /// Time given to i3 to apply floating/resize before reading the window geometry.
@@ -30,6 +37,8 @@ const WINDOW_SETTLE_DELAY: Duration = Duration::from_millis(400);
 /// Menu, status and job refresh rate.
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const ACTION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long the "Recording saved" notification (with its actions) stays up.
+const SAVED_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(config: AppConfig, control_listener: UnixListener) -> Result<()> {
     if std::env::var_os("DISPLAY").is_none() {
@@ -39,6 +48,15 @@ pub fn run(config: AppConfig, control_listener: UnixListener) -> Result<()> {
 
     let (tray_tx, tray_rx) = mpsc::channel();
     let applet = Applet::new(APP_ID, tray_spec(&Status::default()), tray_tx)?;
+    // Probe hardware encoders in the background so the first recording doesn't wait.
+    {
+        let (ffmpeg, choice, device) = (
+            config.recording.ffmpeg.clone(),
+            config.recording.encoder,
+            config.recording.vaapi_device.clone(),
+        );
+        std::thread::spawn(move || encoder::resolve(&ffmpeg, choice, device.as_deref()));
+    }
     let app = App::new(config, applet);
 
     let (actions_tx, actions_rx) = mpsc::channel();
@@ -106,7 +124,9 @@ struct App {
     recording: RefCell<Option<ActiveRecording>>,
     countdown: RefCell<Option<(SourceId, PendingStart)>>,
     jobs: RefCell<Vec<TranscodeJob>>,
-    /// Options from the last setup dialog, offered next time.
+    /// Border around the area being recorded, during the countdown and recording.
+    marker: RefCell<Option<Marker>>,
+    /// Options from the last setup dialog (saved across restarts), offered next time.
     last_options: RefCell<RecordingOptions>,
     shared_status: Arc<Mutex<Status>>,
 }
@@ -114,13 +134,14 @@ struct App {
 impl App {
     fn new(config: AppConfig, applet: Applet<TrayAction>) -> Rc<Self> {
         Rc::new(Self {
-            last_options: RefCell::new(config.default_options()),
+            last_options: RefCell::new(saved_options::load(config.default_options())),
             config,
             applet: RefCell::new(applet),
             phase: Cell::new(Phase::Idle),
             recording: RefCell::new(None),
             countdown: RefCell::new(None),
             jobs: RefCell::new(Vec::new()),
+            marker: RefCell::new(None),
             shared_status: Arc::new(Mutex::new(Status::default())),
         })
     }
@@ -189,6 +210,9 @@ impl App {
     }
 
     fn set_phase(&self, phase: Phase) {
+        if phase == Phase::Idle {
+            self.marker.borrow_mut().take();
+        }
         self.phase.set(phase);
         self.tick();
     }
@@ -319,6 +343,9 @@ impl App {
         };
         let options = setup_dialog::run(&context, &initial);
         if let Some(options) = &options {
+            if let Err(err) = saved_options::save(options) {
+                eprintln!("warning: failed to save recording options: {err:#}");
+            }
             *self.last_options.borrow_mut() = options.clone();
         }
         Ok(options)
@@ -332,6 +359,7 @@ impl App {
         options: RecordingOptions,
         placement: Option<WindowPlacement>,
     ) {
+        self.show_marker(region);
         let pending = PendingStart {
             target,
             region,
@@ -367,6 +395,28 @@ impl App {
             }
         });
         *self.countdown.borrow_mut() = Some((source, pending));
+    }
+
+    fn show_marker(&self, region: Region) {
+        let marker_config = &self.config.marker;
+        if !marker_config.enabled {
+            return;
+        }
+        let Ok(screen) = x11::screen_size() else {
+            return;
+        };
+        if let Some(region) = region.fit_for_encoding(screen.0, screen.1) {
+            *self.marker.borrow_mut() = Some(Marker::show(region, screen, marker_config));
+        }
+    }
+
+    fn encoder(&self) -> VideoEncoder {
+        let recording = &self.config.recording;
+        encoder::resolve(
+            &recording.ffmpeg,
+            recording.encoder,
+            recording.vaapi_device.as_deref(),
+        )
     }
 
     fn record(&self, pending: PendingStart) {
@@ -416,6 +466,7 @@ impl App {
             &display,
             region,
             &options,
+            &self.encoder(),
             capture,
         )?;
         println!(
@@ -513,7 +564,7 @@ impl App {
             let result = std::fs::rename(&capture, &output)
                 .with_context(|| format!("failed to rename {}", capture.display()));
             match result {
-                Ok(()) => notify("Recording saved", &output.display().to_string()),
+                Ok(()) => notify_saved(output, None),
                 Err(err) => self.report(Err(err)),
             }
             return;
@@ -529,6 +580,7 @@ impl App {
                 quality: options.quality,
                 compress: options.compress,
                 keep_capture: options.keep_capture,
+                encoder: self.encoder(),
                 intro,
                 zoom,
             },
@@ -558,6 +610,7 @@ impl App {
             return;
         };
         let active = self.recording.borrow_mut().take();
+        self.marker.borrow_mut().take();
         self.phase.set(Phase::Idle);
         let details = active
             .map(|active| {
@@ -577,7 +630,7 @@ impl App {
             JobState::Running { .. } => true,
             JobState::Done { output } => {
                 println!("saved recording to {}", output.display());
-                notify("Recording saved", &output.display().to_string());
+                notify_saved(output, Some(job.capture.clone()));
                 false
             }
             JobState::Failed { error } => {
@@ -676,6 +729,68 @@ fn output_paths(dir: &Path, base_name: &str, format: Format) -> (PathBuf, PathBu
         dir.join(format!("{stem}.capture.mkv")),
         dir.join(format!("{stem}.{}", format.extension())),
     )
+}
+
+/// "Recording saved" with Open / Show in Folder / Copy / Move to Trash actions. `capture` is
+/// the `.capture.mkv` it was made from, if that may still exist.
+fn notify_saved(output: PathBuf, capture: Option<PathBuf>) {
+    let zoomed = Some(zoomed_path(&output)).filter(|path| path.exists());
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut body = name;
+    if let Ok(metadata) = std::fs::metadata(&output) {
+        body.push_str(&format!(" ({})", desktop::human_size(metadata.len())));
+    }
+    if zoomed.is_some() {
+        body.push_str("\nplus a zoomed copy");
+    }
+
+    let mut actions = vec![("default", "Open"), ("open", "Open")];
+    if zoomed.is_some() {
+        actions.push(("open-zoomed", "Open Zoomed"));
+    }
+    actions.extend([
+        ("folder", "Show in Folder"),
+        ("copy", "Copy"),
+        ("trash", "Move to Trash"),
+    ]);
+
+    notify_with_actions(
+        "Recording saved",
+        &body,
+        SAVED_NOTIFICATION_TIMEOUT,
+        &actions,
+        move |action| {
+            let result = match action.as_str() {
+                "default" | "open" => desktop::open(&output),
+                "open-zoomed" => zoomed.as_deref().map_or(Ok(()), desktop::open),
+                "folder" => desktop::show_in_folder(&output),
+                "copy" => desktop::copy_to_clipboard(&output),
+                "trash" => {
+                    // Everything this recording produced, so a failed take leaves nothing.
+                    let mut paths = vec![output.clone()];
+                    paths.extend(zoomed.clone());
+                    if let Some(capture) = &capture {
+                        paths.push(cursor_log::sidecar_path(capture));
+                        paths.push(capture.clone());
+                    }
+                    desktop::trash(&paths).map(|trashed| {
+                        notify(
+                            "Recording moved to Trash",
+                            &format!("{} file(s)", trashed.len()),
+                        )
+                    })
+                }
+                _ => Ok(()),
+            };
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                notify("slycapture error", &format!("{err:#}"));
+            }
+        },
+    );
 }
 
 fn restore_placement(placement: Option<WindowPlacement>) {

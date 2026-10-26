@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::capture::encoder::EncoderChoice;
 use crate::capture::options::{Format, Quality, RecordingOptions};
 use crate::zoom::ZoomSettings;
 
@@ -21,6 +22,56 @@ pub struct AppConfig {
     pub intro: IntroConfig,
     #[serde(default)]
     pub zoom: ZoomSettings,
+    #[serde(default)]
+    pub marker: MarkerConfig,
+}
+
+/// Border drawn around the recorded area while recording (outside it, so it is never
+/// captured).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MarkerConfig {
+    pub enabled: bool,
+    /// `#rrggbb`.
+    pub color: String,
+    /// Border thickness in pixels.
+    pub width: u32,
+}
+
+impl Default for MarkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            color: "#e5484d".to_string(),
+            width: 3,
+        }
+    }
+}
+
+impl MarkerConfig {
+    /// `color` as 0.0..=1.0 RGB components.
+    pub fn rgb(&self) -> Option<(f64, f64, f64)> {
+        let hex = self.color.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.is_ascii() {
+            return None;
+        }
+        let channel = |range: std::ops::Range<usize>| {
+            u8::from_str_radix(&hex[range], 16)
+                .ok()
+                .map(|value| f64::from(value) / 255.0)
+        };
+        Some((channel(0..2)?, channel(2..4)?, channel(4..6)?))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.rgb().is_none() {
+            bail!("marker.color must look like #rrggbb");
+        }
+        if !(1..=32).contains(&self.width) {
+            bail!("marker.width must be between 1 and 32");
+        }
+        Ok(())
+    }
 }
 
 /// Title card prepended to recordings. `enabled`, `title` and `logo` are defaults for the
@@ -79,6 +130,10 @@ pub struct RecordingConfig {
     pub compress: bool,
     pub keep_capture: bool,
     pub ffmpeg: String,
+    /// Video encoder: auto-detected hardware encoding, or forced.
+    pub encoder: EncoderChoice,
+    /// DRM render node for VAAPI; `None` tries each `/dev/dri/renderD*`.
+    pub vaapi_device: Option<PathBuf>,
 }
 
 impl Default for RecordingConfig {
@@ -94,6 +149,8 @@ impl Default for RecordingConfig {
             compress: true,
             keep_capture: true,
             ffmpeg: "ffmpeg".to_string(),
+            encoder: EncoderChoice::default(),
+            vaapi_device: None,
         }
     }
 }
@@ -104,6 +161,8 @@ pub struct AudioConfig {
     pub microphone: bool,
     /// PulseAudio/PipeWire source name; `None` uses the default source.
     pub microphone_source: Option<String>,
+    /// Denoise and level the microphone (high-pass, FFT denoise, speech normalizer, limiter).
+    pub mic_cleanup: bool,
     pub system_audio: bool,
 }
 
@@ -171,6 +230,7 @@ impl AppConfig {
         self.window.validate()?;
         self.intro.validate()?;
         self.zoom.validate()?;
+        self.marker.validate()?;
         Ok(())
     }
 }
@@ -216,6 +276,7 @@ impl AppConfig {
                     .clone()
                     .unwrap_or_else(|| "default".to_string())
             }),
+            mic_cleanup: self.audio.mic_cleanup,
             system_audio: self.audio.system_audio,
             compress: self.recording.compress,
             keep_capture: self.recording.keep_capture,
@@ -279,6 +340,7 @@ fn discover_config_path() -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::{expand_home, AppConfig};
+    use crate::capture::encoder::EncoderChoice;
     use crate::capture::options::{Format, Quality};
     use std::path::Path;
 
@@ -323,6 +385,25 @@ mod tests {
     #[test]
     fn rejects_long_intro() {
         let cfg = AppConfig::parse("intro:\n  duration: 30\n").expect("config should parse");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_encoder_cleanup_and_marker() {
+        let cfg = AppConfig::parse(
+            "recording:\n  encoder: nvenc\naudio:\n  mic_cleanup: true\nmarker:\n  color: '#00ff80'\n  width: 4\n",
+        )
+        .expect("config should parse");
+        cfg.validate().expect("config should be valid");
+        assert_eq!(cfg.recording.encoder, EncoderChoice::Nvenc);
+        assert!(cfg.default_options().mic_cleanup);
+        assert_eq!(cfg.marker.rgb(), Some((0.0, 1.0, 128.0 / 255.0)));
+        assert!(AppConfig::parse("recording:\n  encoder: quicksync\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_marker_color() {
+        let cfg = AppConfig::parse("marker:\n  color: red\n").expect("config should parse");
         assert!(cfg.validate().is_err());
     }
 

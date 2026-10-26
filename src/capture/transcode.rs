@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use crate::capture::encoder::{Speed, VideoEncoder};
 use crate::capture::options::{Format, Quality};
 use crate::zoom::cursor_log::{self, CursorLog};
 use crate::zoom::{render, zoomed_path, ZoomSettings};
@@ -25,6 +26,8 @@ pub enum JobState {
 #[derive(Clone)]
 pub struct TranscodeJob {
     pub name: String,
+    /// The `.capture.mkv` being processed (removed afterwards unless kept).
+    pub capture: PathBuf,
     state: Arc<Mutex<JobState>>,
 }
 
@@ -35,6 +38,9 @@ pub struct TranscodeSettings {
     /// Re-encode with a slow preset; otherwise only remux.
     pub compress: bool,
     pub keep_capture: bool,
+    /// Encoder for the compression pass and zoom render. A failing hardware encoder is
+    /// retried with libx264.
+    pub encoder: VideoEncoder,
     /// Title card prepended to the recording. Forces a re-encode.
     pub intro: Option<IntroSettings>,
     /// Zoom on clicks using the capture's cursor log. Forces a re-encode.
@@ -81,6 +87,7 @@ impl TranscodeJob {
         let state = Arc::new(Mutex::new(JobState::Running { progress: 0.0 }));
         let job = Self {
             name,
+            capture: capture.clone(),
             state: state.clone(),
         };
 
@@ -125,6 +132,30 @@ fn run(
     settings: &TranscodeSettings,
     state: &Mutex<JobState>,
 ) -> Result<()> {
+    match run_passes(ffmpeg, capture, output, duration, settings, state) {
+        Err(err) if settings.encoder.is_hardware() => {
+            eprintln!(
+                "warning: {} encoding failed, retrying with libx264: {err:#}",
+                settings.encoder.name()
+            );
+            let software = TranscodeSettings {
+                encoder: VideoEncoder::Software,
+                ..settings.clone()
+            };
+            run_passes(ffmpeg, capture, output, duration, &software, state)
+        }
+        result => result,
+    }
+}
+
+fn run_passes(
+    ffmpeg: &str,
+    capture: &Path,
+    output: &Path,
+    duration: Duration,
+    settings: &TranscodeSettings,
+    state: &Mutex<JobState>,
+) -> Result<()> {
     let Some(zoom) = &settings.zoom else {
         return run_ffmpeg(ffmpeg, capture, output, duration, settings, state, (0.0, 1.0));
     };
@@ -153,11 +184,20 @@ fn run_zoomed(
         settings.quality
     };
     let (start, end) = ZOOM_RENDER_PROGRESS;
-    let result = render::render(ffmpeg, capture, &log, &rendered, zoom, quality, |progress| {
-        *state.lock().unwrap() = JobState::Running {
-            progress: start + progress * (end - start),
-        };
-    })
+    let result = render::render(
+        ffmpeg,
+        capture,
+        &log,
+        &rendered,
+        zoom,
+        quality,
+        &settings.encoder,
+        |progress| {
+            *state.lock().unwrap() = JobState::Running {
+                progress: start + progress * (end - start),
+            };
+        },
+    )
     .and_then(|()| {
         run_ffmpeg(
             ffmpeg,
@@ -228,6 +268,10 @@ fn run_ffmpeg(
 }
 
 fn transcode_args(capture: &Path, output: &Path, settings: &TranscodeSettings) -> Vec<String> {
+    // The intro has to be encoded, so it implies compression.
+    let video = (settings.compress || settings.intro.is_some())
+        .then(|| settings.encoder.args(settings.quality, Speed::Thorough));
+
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -236,36 +280,33 @@ fn transcode_args(capture: &Path, output: &Path, settings: &TranscodeSettings) -
         "-progress".into(),
         "pipe:1".into(),
         "-y".into(),
-        "-i".into(),
-        capture.display().to_string(),
     ];
+    if let Some(video) = &video {
+        args.extend(video.global.iter().cloned());
+    }
+    args.extend(["-i".into(), capture.display().to_string()]);
+    let filter = video.as_ref().and_then(|video| video.filter);
     match &settings.intro {
-        Some(intro) => args.extend(intro_args(intro)),
-        None => args.extend(["-map".into(), "0".into()]),
+        Some(intro) => args.extend(intro_args(intro, filter)),
+        None => {
+            args.extend(["-map".into(), "0".into()]);
+            if let Some(filter) = filter {
+                args.extend(["-vf".into(), filter.into()]);
+            }
+        }
     }
 
-    // The intro has to be encoded, so it implies compression.
-    if settings.compress || settings.intro.is_some() {
-        let (quality_flag, quality_value) = match settings.quality {
-            Quality::Lossless => ("-qp", "0".to_string()),
-            quality => ("-crf", quality.crf().to_string()),
-        };
-        args.extend([
-            "-c:v".into(),
-            "libx264".into(),
-            "-preset".into(),
-            "slow".into(),
-            quality_flag.into(),
-            quality_value,
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "192k".into(),
-        ]);
-    } else {
-        args.extend(["-c".into(), "copy".into()]);
+    match video {
+        Some(video) => {
+            args.extend(video.codec);
+            args.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+            ]);
+        }
+        None => args.extend(["-c".into(), "copy".into()]),
     }
 
     if settings.format == Format::Mp4 {
@@ -275,8 +316,9 @@ fn transcode_args(capture: &Path, output: &Path, settings: &TranscodeSettings) -
     args
 }
 
-/// Inputs, filter graph and maps that put `intro` in front of input 0.
-fn intro_args(intro: &IntroSettings) -> Vec<String> {
+/// Inputs, filter graph and maps that put `intro` in front of input 0. `encoder_filter` is
+/// appended to the joined video (hardware upload).
+fn intro_args(intro: &IntroSettings, encoder_filter: Option<&str>) -> Vec<String> {
     let IntroSettings {
         width,
         height,
@@ -324,14 +366,18 @@ fn intro_args(intro: &IntroSettings) -> Vec<String> {
         ",fade=t=in:st=0:d={INTRO_FADE_IN_SECS},fade=t=out:st={fade_out_start}:d={INTRO_FADE_OUT_SECS}\
          ,setsar=1,format=yuv420p[iv];[0:v]setsar=1,format=yuv420p[mv];"
     ));
+    let joined = if encoder_filter.is_some() { "[cv]" } else { "[v]" };
     if intro.audio {
         chain.push_str(&format!(
             "anullsrc=r={INTRO_SAMPLE_RATE}:cl=stereo:d={secs}[ia];\
              [0:a]aresample={INTRO_SAMPLE_RATE},aformat=channel_layouts=stereo[ma];\
-             [iv][ia][mv][ma]concat=n=2:v=1:a=1[v][a]"
+             [iv][ia][mv][ma]concat=n=2:v=1:a=1{joined}[a]"
         ));
     } else {
-        chain.push_str("[iv][mv]concat=n=2:v=1:a=0[v]");
+        chain.push_str(&format!("[iv][mv]concat=n=2:v=1:a=0{joined}"));
+    }
+    if let Some(filter) = encoder_filter {
+        chain.push_str(&format!(";[cv]{filter}[v]"));
     }
 
     args.extend(["-filter_complex".into(), chain, "-map".into(), "[v]".into()]);
@@ -377,6 +423,7 @@ mod tests {
     use super::{
         escape_filter_value, parse_progress, transcode_args, IntroSettings, TranscodeSettings,
     };
+    use crate::capture::encoder::VideoEncoder;
     use crate::capture::options::{Format, Quality};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -387,6 +434,7 @@ mod tests {
             quality,
             compress,
             keep_capture: true,
+            encoder: VideoEncoder::Software,
             intro: None,
             zoom: None,
         }
@@ -482,5 +530,42 @@ mod tests {
         assert!(!joined.contains("-loop"));
         assert!(!joined.contains("[a]"));
         assert!(joined.contains("concat=n=2:v=1:a=0[v]"));
+    }
+
+    #[test]
+    fn hardware_encoder_with_intro_uploads_joined_video() {
+        let mut settings = settings(true, Quality::High);
+        settings.encoder = VideoEncoder::Vaapi {
+            device: PathBuf::from("/dev/dri/renderD128"),
+        };
+        settings.intro = Some(intro(None, true));
+        let args = transcode_args(Path::new("a.capture.mkv"), Path::new("a.mp4"), &settings);
+        let joined = args.join(" ");
+        assert!(joined.contains("-y -vaapi_device /dev/dri/renderD128 -i a.capture.mkv"));
+        assert!(joined.contains("h264_vaapi"));
+        assert!(!joined.contains("-vf"));
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(graph.ends_with("concat=n=2:v=1:a=1[cv][a];[cv]format=nv12,hwupload[v]"));
+    }
+
+    #[test]
+    fn hardware_encoder_without_intro_uses_vf() {
+        let mut settings = settings(true, Quality::High);
+        settings.encoder = VideoEncoder::Vaapi {
+            device: PathBuf::from("/dev/dri/renderD128"),
+        };
+        let joined = transcode_args(Path::new("a.capture.mkv"), Path::new("a.mp4"), &settings)
+            .join(" ");
+        assert!(joined.contains("-map 0 -vf format=nv12,hwupload -c:v h264_vaapi"));
+    }
+
+    #[test]
+    fn remux_ignores_hardware_encoder() {
+        let mut settings = settings(false, Quality::High);
+        settings.encoder = VideoEncoder::Nvenc;
+        let joined = transcode_args(Path::new("a.capture.mkv"), Path::new("a.mp4"), &settings)
+            .join(" ");
+        assert!(joined.contains("-c copy"));
+        assert!(!joined.contains("nvenc"));
     }
 }

@@ -295,6 +295,50 @@ pub fn notify(summary: &str, body: &str) {
     }
 }
 
+/// Show a notification with action buttons. `on_action` runs on the GTK thread with the key of
+/// the chosen action (`"default"` when the notification body is clicked). Falls back to a
+/// plain notification if `notify-send` predates `--action` (libnotify < 0.7.10).
+pub fn notify_with_actions(
+    summary: &str,
+    body: &str,
+    timeout: Duration,
+    actions: &[(&str, &str)],
+    on_action: impl FnOnce(String) + 'static,
+) {
+    let mut args = vec![
+        "-a".to_string(),
+        "slycapture".to_string(),
+        "-t".to_string(),
+        timeout.as_millis().to_string(),
+    ];
+    args.extend(actions.iter().map(|(key, label)| format!("--action={key}={label}")));
+    args.extend([summary.to_string(), body.to_string()]);
+    let (summary, body) = (summary.to_string(), body.to_string());
+
+    // notify-send waits for the notification to close when it has actions.
+    spawn_blocking(
+        move || match Command::new("notify-send").args(&args).output() {
+            Ok(output) if output.status.success() => {
+                let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!key.is_empty()).then_some(key)
+            }
+            Ok(_) => {
+                notify(&summary, &body);
+                None
+            }
+            Err(err) => {
+                eprintln!("warning: failed to send notification: {err}");
+                None
+            }
+        },
+        move |key| {
+            if let Some(key) = key {
+                on_action(key);
+            }
+        },
+    );
+}
+
 /// Run `work` on a background thread and deliver its result to `done` on the GTK thread.
 pub fn spawn_blocking<T, W, D>(work: W, done: D)
 where

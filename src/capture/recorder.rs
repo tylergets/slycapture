@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::capture::audio::{self, Level};
-use crate::capture::options::RecordingOptions;
+use crate::capture::encoder::{Speed, VideoEncoder};
+use crate::capture::options::{Quality, RecordingOptions};
 use crate::capture::Region;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +42,7 @@ impl Recording {
         display: &str,
         region: Region,
         options: &RecordingOptions,
+        encoder: &VideoEncoder,
         output: PathBuf,
     ) -> Result<Self> {
         if let Some(parent) = output.parent() {
@@ -56,7 +58,7 @@ impl Recording {
         let metered = inputs.microphone.is_some();
 
         let mut child = Command::new(ffmpeg)
-            .args(ffmpeg_args(display, region, options, &inputs, &output))
+            .args(ffmpeg_args(display, region, options, encoder, &inputs, &output))
             .stdin(Stdio::piped())
             .stdout(if metered {
                 Stdio::piped()
@@ -156,15 +158,27 @@ fn ffmpeg_args(
     display: &str,
     region: Region,
     options: &RecordingOptions,
+    encoder: &VideoEncoder,
     inputs: &AudioInputs,
     output: &Path,
 ) -> Vec<String> {
+    // When a compression pass follows, capture losslessly so quality is only lost once.
+    let (quality, audio_codec) = if options.compress {
+        (Quality::Lossless, "pcm_s16le")
+    } else {
+        (options.quality, "aac")
+    };
+    let video = encoder.args(quality, Speed::Realtime);
+
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
         "-nostats".into(),
         "-y".into(),
+    ];
+    args.extend(video.global);
+    args.extend([
         "-thread_queue_size".into(),
         INPUT_QUEUE_SIZE.into(),
         "-f".into(),
@@ -177,7 +191,7 @@ fn ffmpeg_args(
         format!("{}x{}", region.width, region.height),
         "-i".into(),
         format!("{display}+{},{}", region.x, region.y),
-    ];
+    ]);
 
     // Input 0 is video; audio inputs follow in this order.
     let audio_sources: Vec<&String> = [&inputs.microphone, &inputs.system]
@@ -196,33 +210,21 @@ fn ffmpeg_args(
     }
 
     args.extend(["-map".into(), "0:v".into()]);
-    match audio_sources.len() {
-        0 => {}
-        1 => args.extend(["-map".into(), "1:a".into()]),
-        _ => args.extend([
+    if let Some(graph) = audio_graph(inputs, options.mic_cleanup) {
+        args.extend([
             "-filter_complex".into(),
-            "[1:a][2:a]amix=inputs=2:duration=longest:normalize=0[aout]".into(),
+            graph,
             "-map".into(),
             "[aout]".into(),
-        ]),
+        ]);
+    } else if !audio_sources.is_empty() {
+        args.extend(["-map".into(), "1:a".into()]);
     }
 
-    // When a compression pass follows, capture losslessly so quality is only lost once.
-    let (video_quality, video_quality_value, audio_codec) = if options.compress {
-        ("-qp", "0".to_string(), "pcm_s16le")
-    } else {
-        ("-crf", options.quality.crf().to_string(), "aac")
-    };
-    args.extend([
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "ultrafast".into(),
-        video_quality.into(),
-        video_quality_value,
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-    ]);
+    if let Some(filter) = video.filter {
+        args.extend(["-vf".into(), filter.into()]);
+    }
+    args.extend(video.codec);
     if !audio_sources.is_empty() {
         args.extend(["-c:a".into(), audio_codec.into()]);
     }
@@ -236,9 +238,33 @@ fn ffmpeg_args(
     args
 }
 
+/// Filter graph producing `[aout]`, when the audio needs more than a plain map: microphone
+/// cleanup and/or mixing the microphone with system audio.
+fn audio_graph(inputs: &AudioInputs, mic_cleanup: bool) -> Option<String> {
+    let cleanup = mic_cleanup && inputs.microphone.is_some();
+    let system = match (&inputs.microphone, &inputs.system) {
+        (Some(_), Some(_)) => Some("[2:a]"),
+        _ => None,
+    };
+    let mix = |mic: &str, system: &str| {
+        format!("{mic}{system}amix=inputs=2:duration=longest:normalize=0[aout]")
+    };
+    match (cleanup, system) {
+        (false, None) => None,
+        (false, Some(system)) => Some(mix("[1:a]", system)),
+        (true, None) => Some(format!("[1:a]{}[aout]", audio::MIC_CLEANUP_FILTER)),
+        (true, Some(system)) => Some(format!(
+            "[1:a]{}[mic];{}",
+            audio::MIC_CLEANUP_FILTER,
+            mix("[mic]", system)
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ffmpeg_args, AudioInputs};
+    use crate::capture::encoder::VideoEncoder;
     use crate::capture::options::{Format, Quality, RecordingOptions};
     use crate::capture::Region;
     use std::path::Path;
@@ -252,6 +278,7 @@ mod tests {
             quality: Quality::High,
             countdown: 0,
             microphone: None,
+            mic_cleanup: false,
             system_audio: false,
             compress: false,
             keep_capture: true,
@@ -268,6 +295,7 @@ mod tests {
             ":0",
             Region::new(100, 50, 1920, 1080),
             &options(),
+            &VideoEncoder::Software,
             &inputs,
             Path::new("/tmp/out.mkv"),
         )
@@ -305,6 +333,7 @@ mod tests {
             ":0",
             Region::new(0, 0, 640, 480),
             &options,
+            &VideoEncoder::Software,
             &AudioInputs {
                 microphone: Some("mic".into()),
                 system: None,
@@ -326,5 +355,48 @@ mod tests {
         assert!(args.contains("-i mic -thread_queue_size 1024 -f pulse -i sink.monitor"));
         assert!(args.contains("amix=inputs=2"));
         assert!(args.contains("-map [aout]"));
+    }
+
+    #[test]
+    fn cleans_up_microphone_before_mixing() {
+        let mut options = options();
+        options.mic_cleanup = true;
+        let inputs = AudioInputs {
+            microphone: Some("mic".into()),
+            system: Some("sink.monitor".into()),
+        };
+        let args = ffmpeg_args(
+            ":0",
+            Region::new(0, 0, 640, 480),
+            &options,
+            &VideoEncoder::Software,
+            &inputs,
+            Path::new("/tmp/out.mkv"),
+        )
+        .join(" ");
+        assert!(args.contains("-filter_complex [1:a]highpass"));
+        assert!(args.contains("[mic];[mic][2:a]amix=inputs=2"));
+        // The meter still reads the raw microphone.
+        assert!(args.ends_with("-map 1:a -ac 1 -ar 16000 -f s16le pipe:1"));
+    }
+
+    #[test]
+    fn hardware_encoder_uploads_frames() {
+        let args = ffmpeg_args(
+            ":0",
+            Region::new(0, 0, 640, 480),
+            &options(),
+            &VideoEncoder::Vaapi {
+                device: "/dev/dri/renderD128".into(),
+            },
+            &AudioInputs {
+                microphone: None,
+                system: None,
+            },
+            Path::new("/tmp/out.mkv"),
+        )
+        .join(" ");
+        assert!(args.starts_with("-hide_banner -loglevel error -nostats -y -vaapi_device"));
+        assert!(args.contains("-map 0:v -vf format=nv12,hwupload -c:v h264_vaapi"));
     }
 }

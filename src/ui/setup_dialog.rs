@@ -260,6 +260,13 @@ pub fn run(context: &SetupContext, initial: &RecordingOptions) -> Option<Recordi
     meter.set_tooltip_text(Some("Microphone level"));
     add_row("Level", meter.upcast_ref());
 
+    let mic_cleanup = gtk::CheckButton::with_label("Clean up voice");
+    mic_cleanup.set_active(initial.mic_cleanup);
+    mic_cleanup.set_tooltip_text(Some(
+        "Remove background noise and hum, even out the speaking level and prevent clipping",
+    ));
+    add_row("", mic_cleanup.upcast_ref());
+
     let system_audio = gtk::CheckButton::with_label("Record system audio (what you hear)");
     system_audio.set_active(initial.system_audio);
     add_row("System audio", system_audio.upcast_ref());
@@ -299,11 +306,13 @@ pub fn run(context: &SetupContext, initial: &RecordingOptions) -> Option<Recordi
         let mic_enabled = mic_enabled.clone();
         let mic_source = mic_source.clone();
         let meter = meter.clone();
+        let mic_cleanup = mic_cleanup.clone();
         let ffmpeg = context.ffmpeg.clone();
         move || {
             audio_meter.borrow_mut().take();
             let enabled = mic_enabled.is_active();
             mic_source.set_sensitive(enabled);
+            mic_cleanup.set_sensitive(enabled);
             meter.set_sensitive(enabled);
             meter.set_value(0.0);
             if !enabled {
@@ -361,6 +370,7 @@ pub fn run(context: &SetupContext, initial: &RecordingOptions) -> Option<Recordi
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| DEFAULT_SOURCE.to_string())
         }),
+        mic_cleanup: mic_cleanup.is_active(),
         system_audio: system_audio.is_active(),
         compress: compress.is_active(),
         keep_capture: keep_capture.is_active(),

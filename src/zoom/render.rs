@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{bail, Context, Result};
 
+use crate::capture::encoder::{Speed, VideoEncoder};
 use crate::capture::options::Quality;
 use crate::zoom::camera::{Camera, CameraPlanner};
 use crate::zoom::cursor_log::{Click, CursorLog};
@@ -32,6 +33,7 @@ const RIPPLE_END_RADIUS: f64 = 38.0;
 const RIPPLE_THICKNESS: f64 = 4.0;
 
 /// Render `capture` zoomed according to `log` into `output`. `on_progress` receives 0.0..=1.0.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     ffmpeg: &str,
     capture: &Path,
@@ -39,6 +41,7 @@ pub fn render(
     output: &Path,
     settings: &ZoomSettings,
     quality: Quality,
+    video_encoder: &VideoEncoder,
     mut on_progress: impl FnMut(f32),
 ) -> Result<()> {
     if paths_match(capture, output) {
@@ -55,7 +58,7 @@ pub fn render(
     let mut decoder = spawn_ffmpeg(ffmpeg, &decoder_args(capture, log), true, false)?;
     let mut encoder = spawn_ffmpeg(
         ffmpeg,
-        &encoder_args(capture, log, &partial, output, quality),
+        &encoder_args(capture, log, &partial, output, quality, video_encoder),
         false,
         true,
     )?;
@@ -192,11 +195,9 @@ fn encoder_args(
     partial: &Path,
     output: &Path,
     quality: Quality,
+    video_encoder: &VideoEncoder,
 ) -> Vec<String> {
-    let (quality_flag, quality_value) = match quality {
-        Quality::Lossless => ("-qp", "0".to_string()),
-        quality => ("-crf", quality.crf().to_string()),
-    };
+    let video = video_encoder.args(quality, Speed::Balanced);
     let mp4 = output
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"));
@@ -206,6 +207,9 @@ fn encoder_args(
         "-loglevel".into(),
         "error".into(),
         "-y".into(),
+    ];
+    args.extend(video.global);
+    args.extend([
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -222,19 +226,17 @@ fn encoder_args(
         "0:v".into(),
         "-map".into(),
         "1:a?".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "medium".into(),
-        quality_flag.into(),
-        quality_value,
-        "-pix_fmt".into(),
-        "yuv420p".into(),
+    ]);
+    if let Some(filter) = video.filter {
+        args.extend(["-vf".into(), filter.into()]);
+    }
+    args.extend(video.codec);
+    args.extend([
         "-c:a".into(),
         "aac".into(),
         "-b:a".into(),
         "192k".into(),
-    ];
+    ]);
     if mp4 {
         args.extend(["-movflags".into(), "+faststart".into()]);
     }
@@ -489,6 +491,7 @@ mod tests {
             &partial_path(output),
             output,
             Quality::High,
+            &VideoEncoder::Software,
         )
         .join(" ");
         assert!(args.contains("-video_size 1280x720 -framerate 30 -i pipe:0"));
@@ -511,6 +514,7 @@ mod tests {
             capture,
             &ZoomSettings::default(),
             Quality::High,
+            &VideoEncoder::Software,
             |_| {},
         );
         assert!(result.is_err());

@@ -69,8 +69,9 @@ impl Quality {
     }
 }
 
-/// Everything chosen in the setup dialog for one recording.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Everything chosen in the setup dialog for one recording. Saved between runs by
+/// [`crate::core::saved_options`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingOptions {
     /// File name prefix; a timestamp and extension are appended.
     pub base_name: String,
@@ -82,6 +83,8 @@ pub struct RecordingOptions {
     pub countdown: u32,
     /// PulseAudio/PipeWire source to record as the microphone, if enabled.
     pub microphone: Option<String>,
+    /// Denoise and level the microphone while recording.
+    pub mic_cleanup: bool,
     /// Record what is playing through the default output.
     pub system_audio: bool,
     /// Re-encode the capture with a slow preset at `quality` after recording.

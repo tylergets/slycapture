@@ -13,6 +13,12 @@ const METER_CHUNK_SAMPLES: usize = (METER_SAMPLE_RATE / 20) as usize;
 /// Levels at or below this many dBFS read as silence.
 const METER_FLOOR_DB: f32 = -60.0;
 
+/// Voice cleanup applied to the microphone while recording: cut rumble below 80 Hz, remove
+/// steady background noise (fans, hum) with an adaptive noise floor, even out the speaking
+/// level, and keep peaks from clipping.
+pub const MIC_CLEANUP_FILTER: &str = "highpass=f=80,afftdn=nr=12:nf=-40:tn=1,\
+     speechnorm=e=4:r=0.0001:l=1,alimiter=limit=0.95";
+
 /// The most recent audio level, 0.0 (silent) to 1.0 (full scale), shared across threads.
 #[derive(Debug, Clone, Default)]
 pub struct Level(Arc<AtomicU32>);
