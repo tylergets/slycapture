@@ -48,13 +48,24 @@ pub const ATTENTION_ICON: BundledIcon = BundledIcon {
 "##,
 };
 
+pub const BUSY_ICON: BundledIcon = BundledIcon {
+    name: "slycapture-processing",
+    svg: r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="9" fill="none" stroke="#f5c542" stroke-width="2"/>
+  <circle cx="12" cy="12" r="4.5" fill="#f5c542"/>
+</svg>
+"##,
+};
+
 const FALLBACK_ICON: &str = "media-record";
 
-/// Which icon is shown: neutral, or red (e.g. while recording).
+/// Which icon is shown: neutral, red (e.g. while recording) or yellow (busy in the
+/// background).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconState {
     Normal,
     Attention,
+    Busy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +100,7 @@ pub struct Applet<A: Clone + Send + 'static> {
     widgets: Vec<gtk::MenuItem>,
     icon: String,
     attention_icon: String,
+    busy_icon: String,
 }
 
 impl<A: Clone + Send + PartialEq + 'static> Applet<A> {
@@ -98,15 +110,17 @@ impl<A: Clone + Send + PartialEq + 'static> Applet<A> {
             eprintln!("warning: DBus session is not set; appindicator may not be visible");
         }
 
-        let (theme_path, icon, attention_icon) =
-            match install_icons(&[&IDLE_ICON, &ATTENTION_ICON]) {
+        let (theme_path, icon, attention_icon, busy_icon) =
+            match install_icons(&[&IDLE_ICON, &ATTENTION_ICON, &BUSY_ICON]) {
                 Some(dir) => (
                     dir.to_string_lossy().into_owned(),
                     IDLE_ICON.name.to_string(),
                     ATTENTION_ICON.name.to_string(),
+                    BUSY_ICON.name.to_string(),
                 ),
                 None => (
                     String::new(),
+                    FALLBACK_ICON.to_string(),
                     FALLBACK_ICON.to_string(),
                     FALLBACK_ICON.to_string(),
                 ),
@@ -137,6 +151,7 @@ impl<A: Clone + Send + PartialEq + 'static> Applet<A> {
             widgets: Vec::new(),
             icon,
             attention_icon,
+            busy_icon,
         };
         applet.rebuild_menu();
         unsafe {
@@ -222,6 +237,7 @@ impl<A: Clone + Send + PartialEq + 'static> Applet<A> {
         let name = match self.spec.icon {
             IconState::Normal => &self.icon,
             IconState::Attention => &self.attention_icon,
+            IconState::Busy => &self.busy_icon,
         };
         if let Ok(name) = CString::new(name.as_str()) {
             unsafe {

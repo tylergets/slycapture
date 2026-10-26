@@ -4,7 +4,7 @@
 
 ## Features
 
-- Tray applet (libappindicator, same as slyboard): red icon while recording;
+- Tray applet (libappindicator, same as slyboard): red icon while recording, yellow while processing;
   **middle-click stops** a recording (if your tray host forwards secondary activation)
 - **Record Entire Screen**
 - **Record Window**: click a window, pick a size (1080p, 720p, 4K, square, vertical, custom…),

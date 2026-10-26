@@ -860,11 +860,15 @@ fn tray_spec(status: &Status) -> TraySpec<TrayAction> {
     TraySpec {
         icon: if active {
             IconState::Attention
+        } else if !status.processing.is_empty() {
+            IconState::Busy
         } else {
             IconState::Normal
         },
         tooltip: if active {
             format!("{headline} (middle-click to stop)")
+        } else if let Some(job) = status.processing.first() {
+            format!("Processing {} — {:.0}%", job.name, job.progress * 100.0)
         } else {
             headline
         },
