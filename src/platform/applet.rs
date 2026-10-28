@@ -160,6 +160,7 @@ impl<A: Clone + Send + PartialEq + 'static> Applet<A> {
                 applet.menu.as_ptr(),
             );
         }
+        super::sni_reregister::keep_registered(applet.indicator);
         applet.apply_icon_and_click_action();
         Ok(applet)
     }
